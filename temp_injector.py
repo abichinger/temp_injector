@@ -3,6 +3,7 @@
 from typing import Any, Callable, List, Dict, Tuple
 import argparse
 import re
+from os import path
 
 class Parameter():
 
@@ -56,7 +57,7 @@ class GCodeInstruction():
 
 class VirtualPrinter():
 
-    def __init__(self, x=None, y=None, z=None, e=None, bed_temp=None, hotend_temp=None, ignore_unknown=True):
+    def __init__(self, x=None, y=None, z=None, e=None, bed_temp=None, hotend_temp=None, ignore_unknown=True, abs_mode=True):
 
         self.x = x
         self.y = y
@@ -67,6 +68,8 @@ class VirtualPrinter():
         self.hotend_temp = hotend_temp
 
         self.ignore_unknown = ignore_unknown
+        self.abs_mode = True
+        self.abs_e_mode = True
 
         self.instruction_set = {} #type: Dict[str, GCodeInstruction]
 
@@ -94,7 +97,7 @@ class VirtualPrinter():
         instr.func(self, args)
 
     def print_status(self):
-        print(f'X:{self.x}, Y:{self.y}, Z:{self.z}, Bed:{self.bed_temp}°, Hotend:{self.hotend_temp}°')
+        print(f'X:{self.x}, Y:{self.y}, Z:{self.z}, E:{self.e}, Bed:{self.bed_temp}°C, Hotend:{self.hotend_temp}°C')
 
 def g28(printer:VirtualPrinter, args:dict):
     printer.x = 0
@@ -102,16 +105,46 @@ def g28(printer:VirtualPrinter, args:dict):
     printer.z = 0
 
 def g0(printer:VirtualPrinter, args:dict):
-    printer.x = args.get('X', printer.x)
-    printer.y = args.get('Y', printer.y)
-    printer.z = args.get('Z', printer.z)
-    printer.e = args.get('E', printer.e)
+    if printer.abs_mode:
+        printer.x = args.get('X', printer.x)
+        printer.y = args.get('Y', printer.y)
+        printer.z = args.get('Z', printer.z)
+        
+    else:
+        printer.x += args.get('X', 0)
+        printer.y += args.get('Y', 0)
+        printer.z += args.get('Z', 0)
+
+    if printer.abs_e_mode:
+        printer.e = args.get('E', printer.e)
+    else:
+        printer.e += args.get('E', 0)
 
 def m104(printer:VirtualPrinter, args:dict):
     printer.hotend_temp = args.get('S', printer.hotend_temp)
 
 def m140(printer:VirtualPrinter, args:dict):
     printer.bed_temp = args.get('S', printer.bed_temp)
+
+def g90(printer:VirtualPrinter, args:dict):
+    printer.abs_mode = True
+    printer.abs_e_mode = True
+
+def g91(printer:VirtualPrinter, args:dict):
+    printer.abs_mode = False
+    printer.abs_e_mode = False
+
+def g92(printer:VirtualPrinter, args:dict):
+    printer.x = args.get('X', printer.x)
+    printer.y = args.get('Y', printer.y)
+    printer.z = args.get('Z', printer.z)
+    printer.e = args.get('E', printer.e)
+
+def m82(printer:VirtualPrinter, args:dict):
+    printer.abs_e_mode = True
+
+def m83(printer:VirtualPrinter, args:dict):
+    printer.abs_e_mode = False
 
 def create_printer():
 
@@ -124,6 +157,11 @@ def create_printer():
     p.register_gcode('M109', [], [('S', float)], m104)
     p.register_gcode('M140', [], [('S', float)], m140)
     p.register_gcode('M190', [], [('S', float)], m140)
+    p.register_gcode('G90', [], [], g90)
+    p.register_gcode('G91', [], [], g91)
+    p.register_gcode('M82', [], [], m82)
+    p.register_gcode('M83', [], [], m83)
+    p.register_gcode('G92', [], [('X', float), ('Y', float), ('Z', float), ('E', float)], g92)
 
     return p
 
@@ -141,50 +179,43 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     p = create_printer()
-    extruding = False
 
     with open(args.input_file, 'r') as in_file:
         with open(args.output_file, 'w') as out_file:
 
-            for line in in_file:
+            for line_number, line in enumerate(in_file):
                 line = line.strip()
                 
-                if not extruding and (line.startswith('M104') or line.startswith('M109')):
+                p_z = p.z if p.z is not None else 0
+                p_hotend_temp = p.hotend_temp if p.hotend_temp is not None else 0
+
+                block_index = int((p_z - args.base_height) / args.section_height)
+                temp_index = int((p_hotend_temp - args.initial_temp) / (args.temp_step))
+                temp = args.initial_temp + args.temp_step*block_index
+                
+                if (line.startswith('M104') or line.startswith('M109')):
                     m = re.search('S\\d+', line)
                     if m is not None:
-                        initial_temp = int(m[0][1:])
-
-                        if initial_temp != args.initial_temp:
+                        old_temp = int(m[0][1:])
+                        if old_temp > 0:
+                            old_line = line
                             line = re.sub('S\\d+', f'S{args.initial_temp}', line)
-                            print(f'Changed initial temp from {initial_temp}° to {args.initial_temp}°')
+                            if line != old_line:
+                                basename = path.basename(args.input_file)
+                                print(f'Replaced "{old_line}" with "{line}" ({basename}:{line_number})')
+
+                if p.hotend_temp >= 100 and p.z > args.base_height:
+
+                    if block_index > temp_index:                        
+                        
+                        temp_gcode = f'M104 S{temp}'
+                        
+                        p.process_line(temp_gcode)
+                        out_file.write(temp_gcode + '\n')
+
+                        p.print_status()
 
                 p.process_line(line)
                 out_file.write(line + '\n')
 
-                if p.hotend_temp is None or p.hotend_temp < 100 or p.e is None or p.e <= 0:
-                    continue
-                elif not extruding:
-                    extruding = True
-                    p.print_status()
-
-                block_index = int((p.z - args.base_height) / args.section_height)
-                temp_index = int(abs(p.hotend_temp - args.initial_temp) / abs(args.temp_step))
-
-                if block_index > temp_index:
-                    next_temp = args.initial_temp + args.temp_step*block_index
-                    temp_gcode = f'M104 S{next_temp}'
-                    
-                    p.process_line(temp_gcode)
-                    out_file.write(temp_gcode + '\n')
-
-                    p.print_status()
-
             out_file.write('M104 S0\n')
-
-                
-
-
-
-
-    
-
