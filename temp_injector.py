@@ -204,7 +204,7 @@ if __name__ == "__main__":
                                 basename = path.basename(args.input_file)
                                 print(f'Replaced "{old_line}" with "{line}" ({basename}:{line_number})')
 
-                if p.hotend_temp >= 100 and p.z > args.base_height:
+                if p_hotend_temp >= 100 and p_z > args.base_height:
 
                     if block_index > temp_index:                        
                         
